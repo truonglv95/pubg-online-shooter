@@ -6,6 +6,7 @@ import { useGameStore } from '@/lib/game/store'
 import JoinScreen from '@/components/game/JoinScreen'
 import GameCanvas from '@/components/game/GameCanvas'
 import Hud from '@/components/game/Hud'
+import SoundManager from '@/components/game/SoundManager'
 
 export default function Home() {
   // Initialise the socket connection & store subscriptions.
@@ -26,6 +27,9 @@ export default function Home() {
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-[#0b1020] text-white">
+      {/* Sound effects (procedural Web Audio) — always mounted so it survives navigation. */}
+      <SoundManager />
+
       {/* Game canvas mounts once the player has joined. */}
       {joined && (
         <GameCanvas onReady={() => setCanvasReady(true)} />

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from 'react'
 import { io, Socket } from 'socket.io-client'
-import { useGameStore, subscribeShots } from './store'
+import { useGameStore, subscribeShots, subscribePickups } from './store'
 import { setObstaclesCache } from './obstacles-cache'
 import type {
   WelcomePayload,
@@ -11,6 +11,11 @@ import type {
   SystemMessage,
   DamagedPayload,
   RespawnPayload,
+  PickupSnapshot,
+  ZoneSnapshot,
+  PickupEvent,
+  LeaderboardPayload,
+  WeaponId,
 } from './types'
 
 let socketRef: Socket | null = null
@@ -23,10 +28,14 @@ export function useGameSocket() {
   const onWelcome = useGameStore((s) => s.onWelcome)
   const onTick = useGameStore((s) => s.onTick)
   const onPlayersBatch = useGameStore((s) => s.onPlayersBatch)
+  const onPickupsBatch = useGameStore((s) => s.onPickupsBatch)
+  const onZone = useGameStore((s) => s.onZone)
   const onShot = useGameStore((s) => s.onShot)
   const onSystem = useGameStore((s) => s.onSystem)
   const onDamaged = useGameStore((s) => s.onDamaged)
   const onRespawn = useGameStore((s) => s.onRespawn)
+  const onPickup = useGameStore((s) => s.onPickup)
+  const onLeaderboard = useGameStore((s) => s.onLeaderboard)
   const setConnected = useGameStore((s) => s.setConnected)
   const initialized = useRef(false)
 
@@ -54,10 +63,14 @@ export function useGameSocket() {
     })
     sock.on('tick', (list: PlayerSnapshot[]) => onTick(list))
     sock.on('players-batch', (list: PlayerSnapshot[]) => onPlayersBatch(list))
+    sock.on('pickups-batch', (list: PickupSnapshot[]) => onPickupsBatch(list))
+    sock.on('zone', (z: ZoneSnapshot) => onZone(z))
     sock.on('shot', (s: ShotPayload) => onShot(s))
     sock.on('system', (s: SystemMessage) => onSystem(s))
     sock.on('damaged', (d: DamagedPayload) => onDamaged(d))
     sock.on('respawn', (r: RespawnPayload) => onRespawn(r))
+    sock.on('pickup', (p: PickupEvent) => onPickup(p))
+    sock.on('leaderboard', (l: LeaderboardPayload) => onLeaderboard(l))
 
     return () => {
       sock.off('connect', onConn)
@@ -67,7 +80,8 @@ export function useGameSocket() {
       initialized.current = false
     }
   }, [
-    onWelcome, onTick, onPlayersBatch, onShot, onSystem, onDamaged, onRespawn, setConnected,
+    onWelcome, onTick, onPlayersBatch, onPickupsBatch, onZone, onShot, onSystem,
+    onDamaged, onRespawn, onPickup, onLeaderboard, setConnected,
   ])
 }
 
@@ -83,4 +97,8 @@ export function emitShoot(dir: { x: number; y: number; z: number }, origin: { x:
   socketRef?.emit('shoot', { dir, origin })
 }
 
-export { subscribeShots }
+export function emitSwitchWeapon(weapon: WeaponId) {
+  socketRef?.emit('switchWeapon', { weapon })
+}
+
+export { subscribeShots, subscribePickups }

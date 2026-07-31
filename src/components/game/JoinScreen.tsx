@@ -97,12 +97,28 @@ export default function JoinScreen() {
                 <span>Shoot</span>
               </div>
               <div className="flex items-center gap-2">
+                <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">1-4</kbd>
+                <span>Switch weapon</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Wheel</kbd>
+                <span>Cycle weapon</span>
+              </div>
+              <div className="flex items-center gap-2">
                 <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Hold</kbd>
-                <span>Auto-fire</span>
+                <span>Auto-fire (rifle)</span>
               </div>
             </div>
-            <div className="mt-3 text-[11px] leading-relaxed text-white/40">
-              Click the game area to lock your mouse. Press <kbd className="rounded bg-white/10 px-1 py-0.5 font-mono">Esc</kbd> to release.
+            <div className="mt-3 space-y-1 text-[11px] leading-relaxed text-white/40">
+              <div>
+                Click the game area to lock your mouse. Press <kbd className="rounded bg-white/10 px-1 py-0.5 font-mono">Esc</kbd> to release.
+              </div>
+              <div>
+                Pick up <span className="text-emerald-400">health</span>, <span className="text-amber-400">ammo</span>, and weapon crates scattered around the map.
+              </div>
+              <div>
+                Stay inside the <span className="text-cyan-300">blue zone</span> — it shrinks over time and damages anyone outside.
+              </div>
             </div>
           </div>
         </div>

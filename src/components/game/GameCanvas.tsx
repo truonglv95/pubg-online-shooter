@@ -2,26 +2,26 @@
 
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
+import { EffectComposer, RenderPass, SMAAEffect, BloomEffect, VignetteEffect, EffectPass } from 'postprocessing'
 import { useGameStore } from '@/lib/game/store'
 import { subscribeShots, emitMove, emitShoot, emitSwitchWeapon } from '@/lib/game/socket'
 import { getObstaclesCache } from '@/lib/game/obstacles-cache'
 import type { Obstacle, PlayerSnapshot, ShotPayload, PickupSnapshot, ZoneSnapshot, WeaponId } from '@/lib/game/types'
+import {
+  createHumanoid, animateHumanoid, triggerRecoil, setAlive, applyGunVisual,
+  type HumanoidRig,
+} from './humanoid'
 
 interface Props {
   onReady?: () => void
 }
 
 interface LocalPlayerView {
-  group: THREE.Group
-  body: THREE.Mesh
-  head: THREE.Mesh
-  gun: THREE.Mesh
-  gunMat: THREE.MeshStandardMaterial
+  rig: HumanoidRig
   nameSprite: THREE.Sprite
   hpBar: THREE.Mesh
   hpBarBg: THREE.Mesh
   weaponTagSprite: THREE.Sprite
-  muzzle: THREE.Object3D
   color: string
   name: string
   weapon: WeaponId
@@ -30,21 +30,21 @@ interface LocalPlayerView {
   currentPos: THREE.Vector3
   targetRot: number
   currentRot: number
+  // animation helpers
+  lastPosForVelocity: THREE.Vector3
+  moving: boolean
 }
 
-const PLAYER_HEIGHT = 1.8
 const PLAYER_RADIUS = 0.6
 const CAMERA_HEIGHT = 14
 const CAMERA_DISTANCE = 10
 const MOUSE_SENS = 0.0025
-const BULLET_LIFETIME_MS = 90
-
-// Per-weapon gun mesh dimensions (visual feedback when switching weapons).
-const GUN_VISUALS: Record<WeaponId, { size: [number, number, number]; color: number; offset: [number, number, number] }> = {
-  pistol:  { size: [0.12, 0.12, 0.5], color: 0x333333, offset: [0.3, 0.95, 0.35] },
-  rifle:   { size: [0.14, 0.14, 1.0], color: 0x2a2a2a, offset: [0.32, 0.95, 0.55] },
-  shotgun: { size: [0.18, 0.18, 1.1], color: 0x4a3a2a, offset: [0.32, 0.95, 0.55] },
-  sniper:  { size: [0.12, 0.12, 1.6], color: 0x1a1a2a, offset: [0.32, 1.05, 0.7] },
+const BULLET_LIFETIME_MS = 120
+const WEAPON_COOLDOWNS: Record<WeaponId, number> = {
+  pistol: 280, rifle: 130, shotgun: 700, sniper: 1200,
+}
+const WEAPON_FIRE_MODE: Record<WeaponId, 'semi' | 'auto'> = {
+  pistol: 'semi', rifle: 'auto', shotgun: 'semi', sniper: 'semi',
 }
 
 export default function GameCanvas({ onReady }: Props) {
@@ -63,26 +63,55 @@ export default function GameCanvas({ onReady }: Props) {
     if (!mount) return
 
     // ---------- Renderer / scene / camera ----------
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
+    const renderer = new THREE.WebGLRenderer({
+      antialias: false,  // SMAA in post-processing handles AA
+      powerPreference: 'high-performance',
+      stencil: false,
+      depth: true,
+    })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.setSize(mount.clientWidth, mount.clientHeight)
     renderer.shadowMap.enabled = true
-    renderer.shadowMap.type = THREE.PCFShadowMap
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    renderer.outputColorSpace = THREE.SRGBColorSpace
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = 1.0
     renderer.setClearColor(0x0b1020)
     mount.appendChild(renderer.domElement)
 
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(0x0b1020)
-    scene.fog = new THREE.Fog(0x0b1020, 40, 110)
+    scene.fog = new THREE.Fog(0x0b1020, 40, 130)
 
     const camera = new THREE.PerspectiveCamera(55, mount.clientWidth / mount.clientHeight, 0.1, 500)
     camera.position.set(0, CAMERA_HEIGHT, CAMERA_DISTANCE)
     camera.lookAt(0, 0, 0)
 
+    // ---------- Post-processing (bloom + SMAA + vignette) ----------
+    const composer = new EffectComposer(renderer)
+    composer.addPass(new RenderPass(scene, camera))
+    const smaaEffect = new SMAAEffect({
+      edgeDetection: 'ColorEdgeDetection',
+      preset: 'high',
+    })
+    const bloomEffect = new BloomEffect({
+      intensity: 0.55,
+      luminanceThreshold: 0.55,
+      luminanceSmoothing: 0.25,
+      mipmapBlur: true,
+      radius: 0.6,
+    })
+    const vignetteEffect = new VignetteEffect({
+      darkness: 0.45,
+      offset: 0.35,
+    })
+    composer.addPass(new EffectPass(camera, smaaEffect, bloomEffect, vignetteEffect))
+    composer.setSize(mount.clientWidth, mount.clientHeight)
+
     // ---------- Lights ----------
-    const hemi = new THREE.HemisphereLight(0x88aaff, 0x223344, 0.8)
+    const hemi = new THREE.HemisphereLight(0x88aaff, 0x223344, 0.7)
     scene.add(hemi)
-    const sun = new THREE.DirectionalLight(0xfff4e0, 1.2)
+    const sun = new THREE.DirectionalLight(0xfff4e0, 1.3)
     sun.position.set(30, 50, 20)
     sun.castShadow = true
     sun.shadow.mapSize.set(2048, 2048)
@@ -93,11 +122,18 @@ export default function GameCanvas({ onReady }: Props) {
     sun.shadow.camera.near = 1
     sun.shadow.camera.far = 200
     sun.shadow.bias = -0.0005
+    sun.shadow.normalBias = 0.02
     scene.add(sun)
+
+    // Subtle ambient for fill light
+    const ambient = new THREE.AmbientLight(0x404060, 0.4)
+    scene.add(ambient)
 
     // ---------- Ground ----------
     const groundGeo = new THREE.PlaneGeometry(mapSize, mapSize, 1, 1)
-    const groundMat = new THREE.MeshStandardMaterial({ color: 0x1b2a1b, roughness: 1, metalness: 0 })
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x1b2a1b, roughness: 1, metalness: 0,
+    })
     const ground = new THREE.Mesh(groundGeo, groundMat)
     ground.rotation.x = -Math.PI / 2
     ground.receiveShadow = true
@@ -123,8 +159,8 @@ export default function GameCanvas({ onReady }: Props) {
         const geo = new THREE.BoxGeometry(o.size.x, o.size.y, o.size.z)
         const mat = new THREE.MeshStandardMaterial({
           color: o.id.startsWith('w_') ? 0x444a55 : (o.id.startsWith('c') ? 0x6b5544 : 0x55606b),
-          roughness: 0.9,
-          metalness: 0.05,
+          roughness: 0.85,
+          metalness: 0.1,
         })
         const m = new THREE.Mesh(geo, mat)
         m.position.set(o.pos.x, o.pos.y, o.pos.z)
@@ -142,86 +178,76 @@ export default function GameCanvas({ onReady }: Props) {
     }
 
     // ---------- Zone (battle-royale circle) ----------
-    // Render as a translucent ring on the ground + a vertical "wall" cylinder.
     const zoneGroup = new THREE.Group()
     scene.add(zoneGroup)
-    let zoneRingMesh: THREE.Mesh | null = null
-    let zoneWallMesh: THREE.Mesh | null = null
-    let zoneNextRingMesh: THREE.Mesh | null = null  // shows the next target circle
 
     const buildZone = (z: ZoneSnapshot) => {
       zoneGroup.clear()
-      // Outer (current) ring on the ground
-      const ringGeo = new THREE.RingGeometry(Math.max(0.1, z.radius - 0.4), z.radius, 64)
+      const ringGeo = new THREE.RingGeometry(Math.max(0.1, z.radius - 0.4), z.radius, 96)
       const ringMat = new THREE.MeshBasicMaterial({
-        color: 0x66ddff, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false,
+        color: 0x66ddff, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthTest: false,
       })
-      zoneRingMesh = new THREE.Mesh(ringGeo, ringMat)
-      zoneRingMesh.rotation.x = -Math.PI / 2
-      zoneRingMesh.position.set(z.centerX, 0.05, z.centerZ)
-      zoneRingMesh.renderOrder = 990
-      zoneGroup.add(zoneRingMesh)
+      const ring = new THREE.Mesh(ringGeo, ringMat)
+      ring.rotation.x = -Math.PI / 2
+      ring.position.set(z.centerX, 0.05, z.centerZ)
+      ring.renderOrder = 990
+      zoneGroup.add(ring)
 
-      // Vertical translucent wall cylinder around the perimeter
-      const wallGeo = new THREE.CylinderGeometry(z.radius, z.radius, 8, 64, 1, true)
+      const wallGeo = new THREE.CylinderGeometry(z.radius, z.radius, 10, 96, 1, true)
       const wallMat = new THREE.MeshBasicMaterial({
         color: 0x66ddff, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false,
       })
-      zoneWallMesh = new THREE.Mesh(wallGeo, wallMat)
-      zoneWallMesh.position.set(z.centerX, 4, z.centerZ)
-      zoneGroup.add(zoneWallMesh)
+      const wall = new THREE.Mesh(wallGeo, wallMat)
+      wall.position.set(z.centerX, 5, z.centerZ)
+      zoneGroup.add(wall)
 
-      // Next target ring (during holding phase)
       if (z.targetRadius > 0 && Math.abs(z.targetRadius - z.radius) > 0.5) {
-        const nextGeo = new THREE.RingGeometry(Math.max(0.1, z.targetRadius - 0.2), z.targetRadius, 64)
+        const nextGeo = new THREE.RingGeometry(Math.max(0.1, z.targetRadius - 0.2), z.targetRadius, 96)
         const nextMat = new THREE.MeshBasicMaterial({
-          color: 0xffffff, transparent: true, opacity: 0.35, side: THREE.DoubleSide, depthTest: false,
+          color: 0xffffff, transparent: true, opacity: 0.4, side: THREE.DoubleSide, depthTest: false,
         })
-        zoneNextRingMesh = new THREE.Mesh(nextGeo, nextMat)
-        zoneNextRingMesh.rotation.x = -Math.PI / 2
-        zoneNextRingMesh.position.set(z.targetX, 0.04, z.targetZ)
-        zoneNextRingMesh.renderOrder = 989
-        zoneGroup.add(zoneNextRingMesh)
+        const next = new THREE.Mesh(nextGeo, nextMat)
+        next.rotation.x = -Math.PI / 2
+        next.position.set(z.targetX, 0.04, z.targetZ)
+        next.renderOrder = 989
+        zoneGroup.add(next)
       }
     }
 
     // ---------- Pickups ----------
     const pickupsGroup = new THREE.Group()
     scene.add(pickupsGroup)
-    const pickupViews = new Map<string, { group: THREE.Group; spin: () => void; bob: () => void }>()
+    const pickupViews = new Map<string, { group: THREE.Group; icon: THREE.Mesh; beam: THREE.Mesh }>()
 
     const makePickup = (p: PickupSnapshot) => {
       const group = new THREE.Group()
       let color = 0xffffff
-      let label = '?'
-      if (p.kind === 'health') { color = 0x22cc55; label = '+' }
-      else if (p.kind === 'ammo') { color = 0xddaa33; label = 'A' }
-      else if (p.kind === 'rifle') { color = 0x4488ff; label = 'R' }
-      else if (p.kind === 'shotgun') { color = 0xff8844; label = 'S' }
-      else if (p.kind === 'sniper') { color = 0xff3388; label = 'X' }
+      if (p.kind === 'health') color = 0x22cc55
+      else if (p.kind === 'ammo') color = 0xddaa33
+      else if (p.kind === 'rifle') color = 0x4488ff
+      else if (p.kind === 'shotgun') color = 0xff8844
+      else if (p.kind === 'sniper') color = 0xff3388
 
-      // Base platform
-      const baseGeo = new THREE.CylinderGeometry(0.6, 0.7, 0.15, 12)
-      const baseMat = new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.6, metalness: 0.3 })
+      const baseGeo = new THREE.CylinderGeometry(0.55, 0.65, 0.15, 16)
+      const baseMat = new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.6, metalness: 0.4 })
       const base = new THREE.Mesh(baseGeo, baseMat)
       base.position.y = 0.075
       base.castShadow = true
+      base.receiveShadow = true
       group.add(base)
 
-      // Glowing icon (vertical box) with the kind color
-      const iconGeo = new THREE.BoxGeometry(0.5, 0.5, 0.5)
+      const iconGeo = new THREE.IcosahedronGeometry(0.32, 0)
       const iconMat = new THREE.MeshStandardMaterial({
-        color, emissive: color, emissiveIntensity: 0.6, roughness: 0.3, metalness: 0.4,
+        color, emissive: color, emissiveIntensity: 0.9, roughness: 0.3, metalness: 0.5,
       })
       const icon = new THREE.Mesh(iconGeo, iconMat)
       icon.position.y = 0.7
       icon.castShadow = true
       group.add(icon)
 
-      // Vertical beam (so you can see it from across the map)
-      const beamGeo = new THREE.CylinderGeometry(0.05, 0.2, 6, 8, 1, true)
+      const beamGeo = new THREE.CylinderGeometry(0.04, 0.18, 6, 8, 1, true)
       const beamMat = new THREE.MeshBasicMaterial({
-        color, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false,
+        color, transparent: true, opacity: 0.2, side: THREE.DoubleSide, depthWrite: false,
       })
       const beam = new THREE.Mesh(beamGeo, beamMat)
       beam.position.y = 3
@@ -231,12 +257,7 @@ export default function GameCanvas({ onReady }: Props) {
       group.visible = !p.taken
       pickupsGroup.add(group)
 
-      const initialY = group.position.y
-      return {
-        group,
-        spin: () => { icon.rotation.y += 0.03 },
-        bob: () => { icon.position.y = 0.7 + Math.sin(performance.now() / 400) * 0.08; group.position.y = initialY },
-      }
+      return { group, icon, beam }
     }
 
     const removePickup = (id: string) => {
@@ -268,7 +289,7 @@ export default function GameCanvas({ onReady }: Props) {
       }
     }
 
-    // ---------- Player avatars ----------
+    // ---------- Player avatars (humanoid) ----------
     const playersGroup = new THREE.Group()
     scene.add(playersGroup)
     const views = new Map<string, LocalPlayerView>()
@@ -297,75 +318,43 @@ export default function GameCanvas({ onReady }: Props) {
       return sprite
     }
 
-    const applyGunVisual = (gun: THREE.Mesh, gunMat: THREE.MeshStandardMaterial, weapon: WeaponId) => {
-      const vis = GUN_VISUALS[weapon]
-      gun.scale.set(vis.size[0] / 0.15, vis.size[1] / 0.15, vis.size[2] / 1.0)
-      gun.position.set(vis.offset[0], vis.offset[1] * PLAYER_HEIGHT - PLAYER_HEIGHT, vis.offset[2])
-      gunMat.color.setHex(vis.color)
+    const makeHpBar = () => {
+      const bgGeo = new THREE.PlaneGeometry(1.4, 0.16)
+      const bgMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6, depthTest: false })
+      const bg = new THREE.Mesh(bgGeo, bgMat)
+      bg.renderOrder = 998
+
+      const barGeo = new THREE.PlaneGeometry(1.32, 0.1)
+      const barMat = new THREE.MeshBasicMaterial({ color: 0x33dd55, depthTest: false })
+      const bar = new THREE.Mesh(barGeo, barMat)
+      bar.position.z = 0.001
+      bar.renderOrder = 999
+
+      const container = new THREE.Group()
+      container.add(bg)
+      container.add(bar)
+      return { container, bar, bg }
     }
 
     const makePlayerView = (p: PlayerSnapshot): LocalPlayerView => {
-      const group = new THREE.Group()
-      const color = new THREE.Color(p.color)
+      const rig = createHumanoid(p.color)
+      applyGunVisual(rig, p.currentWeapon)
+      rig.group.position.set(p.pos.x, p.pos.y, p.pos.z)
+      rig.group.rotation.y = p.rot
+      playersGroup.add(rig.group)
 
-      const bodyGeo = new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT - PLAYER_RADIUS * 2, 6, 12)
-      const bodyMat = new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.2 })
-      const body = new THREE.Mesh(bodyGeo, bodyMat)
-      body.position.y = PLAYER_HEIGHT / 2
-      body.castShadow = true
-      group.add(body)
-
-      const headGeo = new THREE.SphereGeometry(0.32, 16, 12)
-      const headMat = new THREE.MeshStandardMaterial({ color: color.clone().lerp(new THREE.Color(0xffffff), 0.3), roughness: 0.4 })
-      const head = new THREE.Mesh(headGeo, headMat)
-      head.position.y = PLAYER_HEIGHT + 0.05
-      head.castShadow = true
-      group.add(head)
-
-      const gunGeo = new THREE.BoxGeometry(0.15, 0.15, 1.0)
-      const gunMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.5, metalness: 0.6 })
-      const gun = new THREE.Mesh(gunGeo, gunMat)
-      gun.position.set(0.35, PLAYER_HEIGHT * 0.55, 0.55)
-      gun.castShadow = true
-      group.add(gun)
-
-      const muzzle = new THREE.Object3D()
-      muzzle.position.set(0.35, PLAYER_HEIGHT * 0.55, 1.1)
-      group.add(muzzle)
-
-      // HP bar
-      const hpBarBgGeo = new THREE.PlaneGeometry(1.4, 0.16)
-      const hpBarBgMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6, depthTest: false })
-      const hpBarBg = new THREE.Mesh(hpBarBgGeo, hpBarBgMat)
-      hpBarBg.position.y = PLAYER_HEIGHT + 0.95
-      hpBarBg.renderOrder = 998
-      group.add(hpBarBg)
-
-      const hpBarGeo = new THREE.PlaneGeometry(1.32, 0.1)
-      const hpBarMat = new THREE.MeshBasicMaterial({ color: 0x33dd55, depthTest: false })
-      const hpBar = new THREE.Mesh(hpBarGeo, hpBarMat)
-      hpBar.position.y = PLAYER_HEIGHT + 0.95
-      hpBar.position.z = 0.001
-      hpBar.renderOrder = 999
-      group.add(hpBar)
-
-      // Name sprite
       const nameSprite = makeTextSprite(p.name, p.color)
-      nameSprite.position.y = PLAYER_HEIGHT + 0.6
-      group.add(nameSprite)
+      rig.nameSpriteAnchor.add(nameSprite)
 
-      // Weapon tag (small sprite under name)
+      const hpBar = makeHpBar()
+      rig.hpBarAnchor.add(hpBar.container)
+
       const weaponTagSprite = makeTextSprite(p.currentWeapon.toUpperCase(), '#ffffff', 22, 0.45)
-      weaponTagSprite.position.y = PLAYER_HEIGHT + 1.3
       weaponTagSprite.scale.set(0.7, 0.7, 1)
-      group.add(weaponTagSprite)
+      rig.weaponTagAnchor.add(weaponTagSprite)
 
-      group.position.set(p.pos.x, p.pos.y, p.pos.z)
-      group.rotation.y = p.rot
-      playersGroup.add(group)
-
-      const v: LocalPlayerView = {
-        group, body, head, gun, gunMat, nameSprite, hpBar, hpBarBg, weaponTagSprite, muzzle,
+      return {
+        rig, nameSprite, hpBar: hpBar.bar, hpBarBg: hpBar.bg, weaponTagSprite,
         color: p.color,
         name: p.name,
         weapon: p.currentWeapon,
@@ -373,29 +362,23 @@ export default function GameCanvas({ onReady }: Props) {
         currentPos: new THREE.Vector3(p.pos.x, p.pos.y, p.pos.z),
         targetRot: p.rot,
         currentRot: p.rot,
+        lastPosForVelocity: new THREE.Vector3(p.pos.x, p.pos.y, p.pos.z),
+        moving: false,
       }
-      applyGunVisual(gun, gunMat, p.currentWeapon)
-      return v
     }
 
     const removePlayerView = (id: string) => {
       const v = views.get(id)
       if (!v) return
-      playersGroup.remove(v.group)
-      v.body.geometry.dispose()
-      ;(v.body.material as THREE.Material).dispose()
-      v.head.geometry.dispose()
-      ;(v.head.material as THREE.Material).dispose()
-      v.gun.geometry.dispose()
-      ;(v.gun.material as THREE.Material).dispose()
+      playersGroup.remove(v.rig.group)
+      v.nameSprite.material.map?.dispose()
+      v.nameSprite.material.dispose()
+      v.weaponTagSprite.material.map?.dispose()
+      v.weaponTagSprite.material.dispose()
       v.hpBar.geometry.dispose()
       ;(v.hpBar.material as THREE.Material).dispose()
-      v.hpBarBg.geometry.dispose()
       ;(v.hpBarBg.material as THREE.Material).dispose()
-      ;(v.nameSprite.material as THREE.SpriteMaterial).map?.dispose()
-      ;(v.nameSprite.material as THREE.SpriteMaterial).dispose()
-      ;(v.weaponTagSprite.material as THREE.SpriteMaterial).map?.dispose()
-      ;(v.weaponTagSprite.material as THREE.SpriteMaterial).dispose()
+      v.hpBarBg.geometry.dispose()
       views.delete(id)
     }
 
@@ -403,28 +386,7 @@ export default function GameCanvas({ onReady }: Props) {
     const keys: Record<string, boolean> = {}
     const mouse = { down: false }
     let pointerLocked = false
-    // Track whether mouse button is currently held AND we already fired the first shot
-    // (for semi-auto weapons we need a fresh click for each shot).
     let mouseHeldSinceLastShot = false
-
-    const WEAPON_COOLDOWNS: Record<WeaponId, number> = {
-      pistol: 280, rifle: 130, shotgun: 700, sniper: 1200,
-    }
-    const WEAPON_FIRE_MODE: Record<WeaponId, 'semi' | 'auto'> = {
-      pistol: 'semi', rifle: 'auto', shotgun: 'semi', sniper: 'semi',
-    }
-
-    const onKeyDown = (e: KeyboardEvent) => {
-      keys[e.code] = true
-      if (e.code === 'Space') e.preventDefault()
-      // Weapon switch hotkeys: 1=pistol, 2=rifle, 3=shotgun, 4=sniper
-      if (e.code === 'Digit1') trySwitchWeapon('pistol')
-      else if (e.code === 'Digit2') trySwitchWeapon('rifle')
-      else if (e.code === 'Digit3') trySwitchWeapon('shotgun')
-      else if (e.code === 'Digit4') trySwitchWeapon('sniper')
-      // Mouse wheel: cycle weapons (handled in wheel event below)
-    }
-    const onKeyUp = (e: KeyboardEvent) => { keys[e.code] = false }
 
     const trySwitchWeapon = (w: WeaponId) => {
       const self = selfIdRef.current
@@ -434,10 +396,18 @@ export default function GameCanvas({ onReady }: Props) {
       if (!me.unlocked[w]) return
       if (me.currentWeapon === w) return
       emitSwitchWeapon(w)
-      // Play click sound (via window sfx hook)
       ;(window as any).__sfx?.playClick?.()
     }
 
+    const onKeyDown = (e: KeyboardEvent) => {
+      keys[e.code] = true
+      if (e.code === 'Space') e.preventDefault()
+      if (e.code === 'Digit1') trySwitchWeapon('pistol')
+      else if (e.code === 'Digit2') trySwitchWeapon('rifle')
+      else if (e.code === 'Digit3') trySwitchWeapon('shotgun')
+      else if (e.code === 'Digit4') trySwitchWeapon('sniper')
+    }
+    const onKeyUp = (e: KeyboardEvent) => { keys[e.code] = false }
     const onMouseMove = (e: MouseEvent) => {
       if (!pointerLocked) return
       const self = selfIdRef.current
@@ -475,9 +445,7 @@ export default function GameCanvas({ onReady }: Props) {
       pointerLocked = document.pointerLockElement === renderer.domElement
     }
     const onCanvasClick = () => {
-      if (!pointerLocked) {
-        renderer.domElement.requestPointerLock?.()
-      }
+      if (!pointerLocked) renderer.domElement.requestPointerLock?.()
     }
 
     window.addEventListener('keydown', onKeyDown)
@@ -491,6 +459,9 @@ export default function GameCanvas({ onReady }: Props) {
 
     // ---------- Shooting ----------
     let lastShotTs = 0
+    // Camera FOV punch on shoot (visual recoil feel)
+    let fovPunch = 0
+    const baseFov = 55
 
     const tryShoot = () => {
       const self = selfIdRef.current
@@ -505,24 +476,24 @@ export default function GameCanvas({ onReady }: Props) {
       const now = performance.now()
       if (now - lastShotTs < cooldown) return
 
-      // Semi-auto: require a fresh click for each shot
       if (WEAPON_FIRE_MODE[weapon] === 'semi' && mouseHeldSinceLastShot) return
       mouseHeldSinceLastShot = true
 
-      // Ammo check
       if (weapon !== 'pistol' && me.ammo[weapon] <= 0) {
-        // Auto-switch back to pistol
         trySwitchWeapon('pistol')
         return
       }
-
       lastShotTs = now
 
+      // Trigger recoil animation on the player's own rig
+      triggerRecoil(v.rig)
+      // Camera FOV punch (subtle zoom-out then back)
+      fovPunch = weapon === 'sniper' ? 4 : weapon === 'shotgun' ? 3 : 1.5
+
       const muzzleWorld = new THREE.Vector3()
-      v.muzzle.getWorldPosition(muzzleWorld)
-      const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(v.group.quaternion).normalize()
-      const dir = forward.clone()
-      emitShoot({ x: dir.x, y: dir.y, z: dir.z }, { x: muzzleWorld.x, y: muzzleWorld.y, z: muzzleWorld.z })
+      v.rig.muzzle.getWorldPosition(muzzleWorld)
+      const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(v.rig.group.quaternion).normalize()
+      emitShoot({ x: forward.x, y: forward.y, z: forward.z }, { x: muzzleWorld.x, y: muzzleWorld.y, z: muzzleWorld.z })
 
       spawnMuzzleFlash(muzzleWorld, weapon)
     }
@@ -540,38 +511,93 @@ export default function GameCanvas({ onReady }: Props) {
         weapon === 'sniper' ? 0xff3366 :
         weapon === 'shotgun' ? 0xff8855 :
         0xffee88
-      const mat = new THREE.LineBasicMaterial({
-        color, transparent: true, opacity: 0.95,
-      })
+      const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.95, linewidth: 2 })
       const line = new THREE.Line(geo, mat)
       tracerGroup.add(line)
       tracers.push({ line, born: performance.now() })
     }
 
+    // ---------- Muzzle flash ----------
     const muzzleFlashGroup = new THREE.Group()
     scene.add(muzzleFlashGroup)
-    interface Flash { mesh: THREE.Mesh; born: number }
+    interface Flash { mesh: THREE.Mesh; born: number; lifetime: number }
     const flashes: Flash[] = []
     const spawnMuzzleFlash = (at: THREE.Vector3, weapon: WeaponId) => {
-      const size = weapon === 'shotgun' ? 0.5 : weapon === 'sniper' ? 0.4 : 0.25
-      const geo = new THREE.SphereGeometry(size, 8, 8)
+      const size = weapon === 'shotgun' ? 0.55 : weapon === 'sniper' ? 0.5 : 0.3
+      const geo = new THREE.SphereGeometry(size, 12, 8)
       const color = weapon === 'sniper' ? 0xff5566 : 0xffcc55
-      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 })
+      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
       const m = new THREE.Mesh(geo, mat)
       m.position.copy(at)
       muzzleFlashGroup.add(m)
-      flashes.push({ mesh: m, born: performance.now() })
+      flashes.push({ mesh: m, born: performance.now(), lifetime: weapon === 'sniper' ? 90 : 60 })
     }
 
+    // ---------- Blood / hit particles ----------
+    interface Particle {
+      mesh: THREE.Mesh
+      velocity: THREE.Vector3
+      born: number
+      lifetime: number
+      gravity: number
+    }
+    const particles: Particle[] = []
+    const particleGroup = new THREE.Group()
+    scene.add(particleGroup)
+    const spawnHitParticles = (at: THREE.Vector3, color: number, count = 8) => {
+      for (let i = 0; i < count; i++) {
+        const geo = new THREE.SphereGeometry(0.08, 6, 4)
+        const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1 })
+        const m = new THREE.Mesh(geo, mat)
+        m.position.copy(at)
+        particleGroup.add(m)
+        const angle = Math.random() * Math.PI * 2
+        const speed = 2 + Math.random() * 4
+        const upSpeed = 1 + Math.random() * 3
+        particles.push({
+          mesh: m,
+          velocity: new THREE.Vector3(Math.cos(angle) * speed, upSpeed, Math.sin(angle) * speed),
+          born: performance.now(),
+          lifetime: 500 + Math.random() * 200,
+          gravity: 12,
+        })
+      }
+    }
+
+    // ---------- Footstep dust ----------
+    interface Dust { mesh: THREE.Mesh; born: number; lifetime: number }
+    const dusts: Dust[] = []
+    const dustGroup = new THREE.Group()
+    scene.add(dustGroup)
+    let lastDustTime = 0
+    const spawnFootstepDust = (at: THREE.Vector3) => {
+      const now = performance.now()
+      if (now - lastDustTime < 200) return
+      lastDustTime = now
+      const geo = new THREE.CircleGeometry(0.3, 8)
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x887755, transparent: true, opacity: 0.5, depthWrite: false,
+      })
+      const m = new THREE.Mesh(geo, mat)
+      m.rotation.x = -Math.PI / 2
+      m.position.set(at.x, 0.05, at.z)
+      dustGroup.add(m)
+      dusts.push({ mesh: m, born: now, lifetime: 400 })
+    }
+
+    // ---------- Subscribe to shots ----------
     const unsubShots = subscribeShots((s: ShotPayload) => {
       const origin = new THREE.Vector3(s.origin.x, s.origin.y, s.origin.z)
       for (const tracer of s.tracers) {
-        spawnTracer(
-          origin,
-          new THREE.Vector3(tracer.end.x, tracer.end.y, tracer.end.z),
-          s.weapon,
-          !!tracer.hitPlayerId,
-        )
+        const end = new THREE.Vector3(tracer.end.x, tracer.end.y, tracer.end.z)
+        spawnTracer(origin, end, s.weapon, !!tracer.hitPlayerId)
+        if (tracer.hitPlayerId) {
+          // Spawn blood particles at hit point
+          spawnHitParticles(end, 0xcc2222, 10)
+        } else {
+          // Spark particles at impact point
+          spawnHitParticles(end, 0xffaa44, 4)
+        }
       }
     })
 
@@ -589,61 +615,51 @@ export default function GameCanvas({ onReady }: Props) {
         }
         v.targetPos.set(snap.pos.x, snap.pos.y, snap.pos.z)
         v.targetRot = snap.rot
+
+        // HP bar
         const ratio = Math.max(0, snap.hp) / 100
         v.hpBar.scale.x = ratio
         v.hpBar.position.x = -(1 - ratio) * 0.66
         const hpColor = ratio > 0.6 ? 0x33dd55 : ratio > 0.3 ? 0xffaa22 : 0xff3322
         ;(v.hpBar.material as THREE.MeshBasicMaterial).color.setHex(hpColor)
-        v.group.visible = true
-        if (!snap.alive) {
-          ;(v.body.material as THREE.MeshStandardMaterial).transparent = true
-          ;(v.body.material as THREE.MeshStandardMaterial).opacity = 0.25
-          ;(v.head.material as THREE.MeshStandardMaterial).transparent = true
-          ;(v.head.material as THREE.MeshStandardMaterial).opacity = 0.25
-          ;(v.gun.material as THREE.MeshStandardMaterial).transparent = true
-          ;(v.gun.material as THREE.MeshStandardMaterial).opacity = 0.25
-          v.hpBar.visible = false
-          v.hpBarBg.visible = false
-          v.nameSprite.visible = false
-          v.weaponTagSprite.visible = false
-        } else {
-          ;(v.body.material as THREE.MeshStandardMaterial).transparent = false
-          ;(v.body.material as THREE.MeshStandardMaterial).opacity = 1
-          ;(v.head.material as THREE.MeshStandardMaterial).transparent = false
-          ;(v.head.material as THREE.MeshStandardMaterial).opacity = 1
-          ;(v.gun.material as THREE.MeshStandardMaterial).transparent = false
-          ;(v.gun.material as THREE.MeshStandardMaterial).opacity = 1
-          const isSelf = id === selfIdRef.current
-          v.hpBar.visible = !isSelf
-          v.hpBarBg.visible = !isSelf
-          v.nameSprite.visible = !isSelf
-          v.weaponTagSprite.visible = !isSelf
-        }
+
+        // Alive/dead state
+        setAlive(v.rig, snap.alive)
+
+        // Visibility of name/hp
+        const isSelf = id === selfIdRef.current
+        v.nameSprite.visible = !isSelf && snap.alive
+        v.hpBar.visible = !isSelf && snap.alive
+        v.hpBarBg.visible = !isSelf && snap.alive
+        v.weaponTagSprite.visible = !isSelf && snap.alive
+
+        // Body ghosting when dead
+        v.rig.bodyMat.transparent = !snap.alive
+        v.rig.bodyMat.opacity = snap.alive ? 1 : 0.35
+        v.rig.headMat.transparent = !snap.alive
+        v.rig.headMat.opacity = snap.alive ? 1 : 0.35
+
         if (v.name !== snap.name) {
-          v.group.remove(v.nameSprite)
-          ;(v.nameSprite.material as THREE.SpriteMaterial).map?.dispose()
-          ;(v.nameSprite.material as THREE.SpriteMaterial).dispose()
+          v.rig.nameSpriteAnchor.remove(v.nameSprite)
+          v.nameSprite.material.map?.dispose()
+          v.nameSprite.material.dispose()
           const newSprite = makeTextSprite(snap.name, snap.color)
-          newSprite.position.y = PLAYER_HEIGHT + 0.6
-          v.group.add(newSprite)
+          v.rig.nameSpriteAnchor.add(newSprite)
           v.nameSprite = newSprite
           v.name = snap.name
         }
         if (v.color !== snap.color) {
-          ;(v.body.material as THREE.MeshStandardMaterial).color.set(snap.color)
+          v.rig.bodyMat.color.set(snap.color)
           v.color = snap.color
         }
-        // Update weapon visuals
         if (v.weapon !== snap.currentWeapon) {
-          applyGunVisual(v.gun, v.gunMat, snap.currentWeapon)
-          // Update weapon tag
-          v.group.remove(v.weaponTagSprite)
-          ;(v.weaponTagSprite.material as THREE.SpriteMaterial).map?.dispose()
-          ;(v.weaponTagSprite.material as THREE.SpriteMaterial).dispose()
+          applyGunVisual(v.rig, snap.currentWeapon)
+          v.rig.weaponTagAnchor.remove(v.weaponTagSprite)
+          v.weaponTagSprite.material.map?.dispose()
+          v.weaponTagSprite.material.dispose()
           const tag = makeTextSprite(snap.currentWeapon.toUpperCase(), '#ffffff', 22, 0.45)
-          tag.position.y = PLAYER_HEIGHT + 1.3
           tag.scale.set(0.7, 0.7, 1)
-          v.group.add(tag)
+          v.rig.weaponTagAnchor.add(tag)
           v.weaponTagSprite = tag
           v.weapon = snap.currentWeapon
         }
@@ -651,9 +667,7 @@ export default function GameCanvas({ onReady }: Props) {
       for (const id of Array.from(views.keys())) {
         if (!seen.has(id)) removePlayerView(id)
       }
-      // Pickups
       syncPickups(state.pickups)
-      // Zone
       if (state.zone) buildZone(state.zone)
     })
 
@@ -664,6 +678,7 @@ export default function GameCanvas({ onReady }: Props) {
     const SPEED = constants.PLAYER_SPEED
     let lastEmit = 0
     const EMIT_INTERVAL = 50
+    let dustAccumulator = 0
 
     const movePlayer = (dt: number) => {
       const self = selfIdRef.current
@@ -688,7 +703,6 @@ export default function GameCanvas({ onReady }: Props) {
         v.targetPos.z = Math.max(-half, Math.min(half, v.targetPos.z))
       }
 
-      // Auto-fire for AUTO weapons only; SEMI requires fresh click
       if (mouse.down) {
         const weapon = me.currentWeapon
         if (WEAPON_FIRE_MODE[weapon] === 'auto') tryShoot()
@@ -707,6 +721,9 @@ export default function GameCanvas({ onReady }: Props) {
     // ---------- Animation loop ----------
     let raf = 0
     let prev = performance.now()
+    const camTargetPos = new THREE.Vector3(0, CAMERA_HEIGHT, CAMERA_DISTANCE)
+    const camLookTarget = new THREE.Vector3()
+
     const animate = () => {
       raf = requestAnimationFrame(animate)
       const now = performance.now()
@@ -715,38 +732,77 @@ export default function GameCanvas({ onReady }: Props) {
 
       movePlayer(dt)
 
+      // Interpolate + animate humanoids
       const lerpFactor = 1 - Math.pow(0.001, dt)
       for (const v of views.values()) {
+        // Position lerp + compute movement for walk animation
+        const prevCurrent = v.currentPos.clone()
         v.currentPos.lerp(v.targetPos, lerpFactor)
-        v.group.position.copy(v.currentPos)
+        v.rig.group.position.copy(v.currentPos)
+
+        // Compute actual movement speed for walk cycle
+        const moveDelta = v.currentPos.distanceTo(prevCurrent)
+        const speed01 = Math.min(1, moveDelta / (SPEED * dt * 0.8))
+        v.moving = speed01 > 0.05
+
+        // Spawn footstep dust when moving
+        if (v.moving && v.rig.alive) {
+          dustAccumulator += dt
+          if (dustAccumulator > 0.3) {
+            dustAccumulator = 0
+            spawnFootstepDust(v.currentPos)
+          }
+        }
+
+        // Rotation
         let dr = v.targetRot - v.currentRot
         while (dr > Math.PI) dr -= Math.PI * 2
         while (dr < -Math.PI) dr += Math.PI * 2
         v.currentRot += dr * lerpFactor
-        v.group.rotation.y = v.currentRot
+        v.rig.group.rotation.y = v.currentRot
+
+        // Animate the humanoid rig (walk cycle, idle, recoil, death)
+        animateHumanoid(v.rig, dt, v.moving, speed01)
+
+        // Billboard HP bar / name / weapon tag
         v.hpBar.quaternion.copy(camera.quaternion)
         v.hpBarBg.quaternion.copy(camera.quaternion)
         v.nameSprite.quaternion.copy(camera.quaternion)
         v.weaponTagSprite.quaternion.copy(camera.quaternion)
       }
 
-      // Pickup spin/bob
-      for (const pv of pickupViews.values()) {
-        if (pv.group.visible) { pv.spin(); pv.bob() }
-      }
-
-      // Camera follows local player
+      // Camera follows local player with damping
       const self = selfIdRef.current
       if (self) {
         const v = views.get(self)
         if (v) {
           const target = v.currentPos
-          const camOffset = new THREE.Vector3(0, CAMERA_HEIGHT, CAMERA_DISTANCE)
-          camera.position.lerp(
-            new THREE.Vector3(target.x + camOffset.x, target.y + camOffset.y, target.z + camOffset.z),
-            lerpFactor,
+          const desiredPos = new THREE.Vector3(
+            target.x,
+            target.y + CAMERA_HEIGHT,
+            target.z + CAMERA_DISTANCE,
           )
-          camera.lookAt(target.x, target.y + 1, target.z)
+          camTargetPos.lerp(desiredPos, 1 - Math.pow(0.005, dt))  // smooth damping
+          camera.position.copy(camTargetPos)
+
+          // FOV punch decay
+          fovPunch = Math.max(0, fovPunch - dt * 12)
+          camera.fov = baseFov + fovPunch
+          camera.updateProjectionMatrix()
+
+          // Look-at target with slight lead forward
+          const lookDesired = new THREE.Vector3(target.x, target.y + 1, target.z)
+          camLookTarget.lerp(lookDesired, 1 - Math.pow(0.001, dt))
+          camera.lookAt(camLookTarget)
+        }
+      }
+
+      // Pickup spin/bob
+      for (const pv of pickupViews.values()) {
+        if (pv.group.visible) {
+          pv.icon.rotation.y += 0.025
+          pv.icon.rotation.x += 0.012
+          pv.icon.position.y = 0.7 + Math.sin(now / 400) * 0.08
         }
       }
 
@@ -764,22 +820,65 @@ export default function GameCanvas({ onReady }: Props) {
           ;(t.line.material as THREE.LineBasicMaterial).opacity = a * 0.95
         }
       }
+
+      // Muzzle flashes
       for (let i = flashes.length - 1; i >= 0; i--) {
         const f = flashes[i]
         const age = now - f.born
-        if (age > 60) {
+        if (age > f.lifetime) {
           muzzleFlashGroup.remove(f.mesh)
           f.mesh.geometry.dispose()
           ;(f.mesh.material as THREE.Material).dispose()
           flashes.splice(i, 1)
         } else {
-          const a = 1 - age / 60
-          ;(f.mesh.material as THREE.MeshBasicMaterial).opacity = a * 0.9
-          f.mesh.scale.setScalar(1 + (1 - a) * 0.8)
+          const a = 1 - age / f.lifetime
+          ;(f.mesh.material as THREE.MeshBasicMaterial).opacity = a * 0.95
+          f.mesh.scale.setScalar(1 + (1 - a) * 1.2)
         }
       }
 
-      renderer.render(scene, camera)
+      // Particles (blood / sparks)
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i]
+        const age = now - p.born
+        if (age > p.lifetime) {
+          particleGroup.remove(p.mesh)
+          p.mesh.geometry.dispose()
+          ;(p.mesh.material as THREE.Material).dispose()
+          particles.splice(i, 1)
+        } else {
+          const a = 1 - age / p.lifetime
+          ;(p.mesh.material as THREE.MeshBasicMaterial).opacity = a
+          p.velocity.y -= p.gravity * dt
+          p.mesh.position.x += p.velocity.x * dt
+          p.mesh.position.y += p.velocity.y * dt
+          p.mesh.position.z += p.velocity.z * dt
+          if (p.mesh.position.y < 0.05) {
+            p.mesh.position.y = 0.05
+            p.velocity.y *= -0.3
+            p.velocity.x *= 0.7
+            p.velocity.z *= 0.7
+          }
+        }
+      }
+
+      // Dust particles
+      for (let i = dusts.length - 1; i >= 0; i--) {
+        const d = dusts[i]
+        const age = now - d.born
+        if (age > d.lifetime) {
+          dustGroup.remove(d.mesh)
+          d.mesh.geometry.dispose()
+          ;(d.mesh.material as THREE.Material).dispose()
+          dusts.splice(i, 1)
+        } else {
+          const a = 1 - age / d.lifetime
+          ;(d.mesh.material as THREE.MeshBasicMaterial).opacity = a * 0.5
+          d.mesh.scale.setScalar(1 + (1 - a) * 1.5)
+        }
+      }
+
+      composer.render()
     }
     animate()
 
@@ -789,6 +888,7 @@ export default function GameCanvas({ onReady }: Props) {
       camera.aspect = mount.clientWidth / mount.clientHeight
       camera.updateProjectionMatrix()
       renderer.setSize(mount.clientWidth, mount.clientHeight)
+      composer.setSize(mount.clientWidth, mount.clientHeight)
     }
     window.addEventListener('resize', onResize)
 
@@ -810,6 +910,7 @@ export default function GameCanvas({ onReady }: Props) {
       unsubStore()
       for (const id of Array.from(views.keys())) removePlayerView(id)
       for (const id of Array.from(pickupViews.keys())) removePickup(id)
+      composer.dispose()
       renderer.dispose()
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement)

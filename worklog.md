@@ -45,3 +45,69 @@ Stage Summary:
 - Game server runs as a double-forked daemon via `python3 scripts/start_game_server.py start`.
 
 ---
+
+---
+Task ID: 2
+Agent: main (Super Z)
+Task: Hoàn thiện thêm các phần về tính năng của game (ý 2 và ý 3 từ gợi ý trước — shrinking zone, pickups, đa vũ khí, sound effects, persistent leaderboard).
+
+Work Log:
+- Đọc lại toàn bộ code hiện tại để xác định điểm tích hợp: server index.ts, store.ts, types.ts, GameCanvas.tsx, Hud.tsx.
+- Implement **Shrinking Zone (battle-royale circle)** trong server:
+  - 7 phases (hold+shrink), DPS tăng dần từ 1→18.
+  - Server-authoritative damage mỗi tick cho player ngoài vùng.
+  - randomSpawn() chọn điểm trong zone để respawn không chết liền.
+  - 'Zone' attribution trong kill feed.
+- Implement **Pickups** (18 items: 6 health, 6 ammo, 2x mỗi weapon):
+  - Server-side collision pickup (radius 1.2 unit), respawn 12s.
+  - Health +50 HP, ammo topup, weapon crate unlock + auto-switch.
+  - Reset fresh loadout khi respawn.
+- Implement **Multi-weapon system (4 weapons)**:
+  - Pistol (14 dmg, infinite), Rifle (16 dmg, auto-fire), Shotgun (9x8 pellets, gần), Sniper (75 dmg, xa).
+  - Switch bằng keys 1-4 hoặc mouse wheel.
+  - Auto-switch pistol khi hết ammo.
+  - Per-weapon gun mesh + tracer color + sound.
+  - Semi-auto yêu cầu fresh click, rifle là auto-fire.
+- Implement **Sound effects** qua procedural Web Audio (không cần file):
+  - Tạo `SoundManager.tsx` component mount ở page level.
+  - Per-weapon shoot sounds với noise bursts.
+  - Hit marker, take damage, kill, pickup, zone warning, respawn, click.
+  - Distance attenuation (>40 units không play).
+  - Mute toggle button trong HUD.
+  - Auto-resume AudioContext trên first gesture.
+- Implement **Persistent Leaderboard** (file-backed JSON):
+  - Server ghi `/tmp/game-server-leaderboard.json` với per-name: kills, deaths, bestStreak.
+  - Update trên mỗi kill và disconnect, broadcast mỗi 5s.
+  - HUD có 2 tabs: Session (live) và All-Time (persistent) với fire emoji + best streak.
+- **HUD redesign hoàn toàn**:
+  - Top-left: Zone panel (phase, timer, progress, warning).
+  - Top-center: K/D/Online counters.
+  - Top-right: tabbed leaderboard.
+  - Bottom-left: color-coded kill feed.
+  - Bottom-center: weapon panel (4 slots) + HP bar.
+  - Bottom-right: mute button + minimap với zone circles.
+  - Respawn overlay với countdown + cause-of-death.
+  - Damage flash, outside-zone pulse overlay.
+- **GameCanvas update**: render zones (ring + wall + next-target), pickups (glowing box + light beam + spin/bob), per-weapon gun visuals, multi-pellet tracers, weapon tag sprite.
+- Cập nhật `types.ts` với WeaponId, WeaponDef, PickupSnapshot, ZoneSnapshot, ShotTracer, LeaderboardPayload, etc.
+- Cập nhật `store.ts` với state mới: pickups, zone, currentWeapon, ammo, unlocked, globalLeaderboard + actions onPickupsBatch/onZone/onPickup/onLeaderboard.
+- Cập nhật `socket.ts` với handlers mới + emitSwitchWeapon.
+- Thêm `scripts/start_next_dev.py` — daemon launcher cho Next.js dev server (cùng pattern double-fork như game-server, cần thiết cho sandbox stability).
+- Khắc phục lỗi circular import và forward-reference trong SoundManager (dùng playSfxRef pattern).
+- Khắc phục lỗi Turbopack stale cache bằng cách restart Next.js dev server.
+- Verify bằng Agent Browser + VLM:
+  - Page load 200 OK, JoinScreen render đúng.
+  - Deploy thành công, HUD đầy đủ: zone phase 1/7, weapon panel 4 slots, leaderboard 2 tabs, minimap với zone circles, mute button.
+  - Player inside zone, HP 100/100, weapon panel hiển thị đúng.
+  - Pickups visible trong 3D world (glowing boxes với light beams).
+  - Zone circle + next-target circle render đúng trên minimap.
+- Commit và push lên GitHub: commit `265c5111` thuộc về truonglv95 <anhtruonglavm2@gmail.com>.
+
+Stage Summary:
+- 4 commits tổng cộng trên GitHub repo, tất cả thuộc về truonglv95.
+- Game giờ là một battle-royale shooter hoàn chỉnh với: shrinking zone, pickups, 4 weapons, sound FX, persistent leaderboard.
+- Game-server chạy ổn định như daemon (double-fork), Next.js cũng chạy như daemon.
+- Stack: Next.js 16 + Three.js + Socket.io + Zustand + Web Audio API + Tailwind 4.
+- Tổng cộng ~1775 dòng thêm, ~260 dòng xóa trong commit này.
+
+---
